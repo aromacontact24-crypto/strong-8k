@@ -147,16 +147,3 @@ Android CTA on page: Strong 8K For Android
 * Ensure your proxy provider allows automated browsing.
 * GA4 filtering requires that your analytics setup recognizes `traffic_type=qa`.
 
----
-
-## 📜 License
-
-MIT License — free to modify and distribute.
-
-```
-
----
-
-If you want, I can also make a **shorter README.md** with just setup and usage instructions.  
-But this one is detailed enough for dev handover and GitHub hosting.
-```
