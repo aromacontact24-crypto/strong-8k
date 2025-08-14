@@ -1,7 +1,7 @@
 
 
 This Python script automates **QA-style website visits** with the following features:
-
+- By https://strong8k.app
 - Uses a **fresh Chromium instance + proxy per visit** (ensuring a new IP each time).
 - Simulates **human-like interaction**:
   - Scroll up/down.
