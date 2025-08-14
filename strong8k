@@ -1,0 +1,594 @@
+import time
+import re
+import random
+import argparse
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+
+from playwright.sync_api import sync_playwright, TimeoutError, Page, Locator
+from rich.console import Console
+from rich.progress import track
+from rich.theme import Theme
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
+import json
+
+# =========================
+# Console / Theming (SSH-friendly)
+# =========================
+theme = Theme({
+    "ok": "bold green",
+    "warn": "bold yellow",
+    "err": "bold red",
+    "info": "cyan",
+    "muted": "dim",
+    "title": "bold bright_white",
+    "label": "bold",
+})
+console = Console(theme=theme, highlight=False, soft_wrap=True)
+
+# === Configuration (explicit & transparent) ===
+PROXY_HOST = "p.webshare.io"
+PROXY_PORT = "80"
+PROXY_USER = "llmbucfb-rotate"   # rotating user usually changes IP on each new connection
+PROXY_PASS = "pd818232l244"
+
+CLIENT_CERT_PATH = "cert.pem"
+CLIENT_KEY_PATH  = "key.pem"
+
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 "
+    "(Automated QA via Playwright)"
+)
+
+CTA_PRIMARY_REGEX = r"\bStrong 8K\b"
+CTA_ANDROID_TEXT  = r"Strong 8K For Android"   # emoji-safe match
+
+# Initial page dwell window (seconds)
+RANDOM_DWELL_MIN = 30.0
+RANDOM_DWELL_MAX = 60.0
+# Android page dwell window (seconds)
+ANDROID_DWELL_MIN = 20.0
+ANDROID_DWELL_MAX = 40.0
+
+
+# =========================
+# Utility: formatting
+# =========================
+def short_text(s: str, max_len: int) -> str:
+    if len(s) <= max_len:
+        return s
+    if max_len <= 1:
+        return s[:max_len]
+    return s[:max_len - 1] + "…"
+
+def term_width() -> int:
+    try:
+        return console.size.width
+    except Exception:
+        return 80
+
+def header_panel(i: int, total: int, url: str, dwell_s: float):
+    w = term_width()
+    url_max = max(20, w - 34)
+    body = (
+        f"[label]Visit:[/label] {i}/{total}\n"
+        f"[label]URL  :[/label] {short_text(url, url_max)}\n"
+        f"[label]Dwell:[/label] ~{int(dwell_s)}s"
+    )
+    console.print(Panel(body, border_style="cyan", title="[title]SESSION[/title]", expand=False))
+
+def summary_table(data: Dict[str, str]):
+    tbl = Table(box=box.SIMPLE_HEAVY, show_header=False, expand=False, padding=(0,1))
+    for k, v in data.items():
+        tbl.add_row(f"[label]{k}[/label]", str(v))
+    console.print(tbl)
+
+
+# =========================
+# Core helpers
+# =========================
+def normalize_url(u: str) -> str:
+    if re.match(r'^[a-z]+://', u, flags=re.I):
+        return u
+    return f"https://{u}"
+
+def unique_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def read_urls(file_path: str) -> List[str]:
+    p = Path(file_path)
+    if not p.exists():
+        console.print(f"[err]✖ URLs file not found:[/err] {file_path}")
+        return []
+    urls: List[str] = []
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        urls.append(normalize_url(line))
+    if not urls:
+        console.print("[warn]⚠️ URLs file is empty after filtering comments/blank lines.[/warn]")
+        return []
+    unique_urls = unique_preserve_order(urls)
+    if len(unique_urls) != len(urls):
+        console.print(f"[info]ℹ️ De-duplicated URLs for fair cycling: {len(urls)} → {len(unique_urls)}[/info]")
+    return unique_urls
+
+def certs_available() -> bool:
+    return Path(CLIENT_CERT_PATH).exists() and Path(CLIENT_KEY_PATH).exists()
+
+def build_proxy_cfg():
+    """Build a fresh proxy config dict for Chromium.launch() each time."""
+    if PROXY_HOST and PROXY_PORT:
+        server = f"http://{PROXY_HOST}:{PROXY_PORT}"
+        cfg = {"server": server}
+        if PROXY_USER:
+            cfg["username"] = PROXY_USER
+        if PROXY_PASS:
+            cfg["password"] = PROXY_PASS
+        return cfg
+    return None
+
+def start_browser(pw):
+    """
+    Launch a brand-new Chromium process with proxy EACH CALL.
+    This guarantees a fresh TCP connection to the proxy for every URL.
+    """
+    proxy_cfg = build_proxy_cfg()
+
+    args = ["--use-gl=egl", "--enable-webgl", "--disable-features=VizDisplayCompositor"]
+    if certs_available():
+        args += [
+            f"--ssl-client-certificate-file={CLIENT_CERT_PATH}",
+            f"--ssl-client-key-file={CLIENT_KEY_PATH}",
+        ]
+    return pw.chromium.launch(proxy=proxy_cfg, args=args, headless=True)
+
+def new_context(browser):
+    return browser.new_context(
+        user_agent=UA,
+        viewport={"width": 1366, "height": 860},
+        ignore_https_errors=True
+    )
+
+# ---------- Optional: verify outbound IP per visit ----------
+def print_outbound_ip(context, enabled: bool):
+    if not enabled:
+        return
+    try:
+        ip_page = context.new_page()
+        ip_page.goto("https://api.ipify.org?format=json", timeout=15000)
+        ip_page.wait_for_load_state("domcontentloaded", timeout=5000)
+        txt = ip_page.evaluate("() => document.body.innerText || ''") or "{}"
+        ip = json.loads(txt).get("ip", "unknown")
+        console.print(f"[info]Proxy IP for this visit: {ip}")
+        ip_page.close()
+    except Exception as e:
+        console.print(f"[warn]⚠️ Could not verify outbound IP: {e}")
+
+# ---------- GA4 QA injection ----------
+def mark_session_as_qa(page: Page):
+    """
+    Injects GA4-friendly markers so this traffic is excluded by GA4 Developer/Internal filters.
+    - Sets debug_mode true
+    - Sets user property traffic_type=qa
+    Works for both gtag.js and GTM (dataLayer) sites.
+    """
+    page.add_init_script("""
+      (function(){
+        try {
+          window.dataLayer = window.dataLayer || [];
+          // GTM-friendly markers
+          window.dataLayer.push({ 'traffic_type': 'qa', 'debug_mode': true });
+
+          // gtag shim (if gtag loads later, these will queue)
+          window.gtag = window.gtag || function(){ window.dataLayer.push(arguments); };
+          gtag('set', 'user_properties', { 'traffic_type': 'qa' });
+          gtag('event', 'page_view', { 'traffic_type': 'qa', 'debug_mode': true });
+
+          // Light belt & suspenders for custom logic / GTM reads
+          localStorage.setItem('qa_automation','1');
+          document.cookie = 'qa_automation=1; path=/; SameSite=Lax';
+        } catch(e) {}
+      })();
+    """)
+
+# ---------- Human simulation ----------
+def deterministic_scroll_exercise(page: Page, duration_seconds: float = 10.0):
+    steps = 15
+    step_wait_ms = int((duration_seconds / (steps * 2)) * 1000) if duration_seconds > 0 else 200
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=10000)
+    except Exception:
+        pass
+    try:
+        height = page.evaluate("() => document.documentElement.scrollHeight")
+        step = max(height // steps, 200)
+        y = 0
+        # Down
+        for _ in range(steps):
+            y += step
+            page.evaluate("y => window.scrollTo({top: y, behavior: 'instant'})", y)
+            page.wait_for_timeout(step_wait_ms)
+        page.wait_for_timeout(400)
+        # Up
+        for _ in range(steps):
+            y -= step
+            if y < 0:
+                y = 0
+            page.evaluate("y => window.scrollTo({top: y, behavior: 'instant'})", y)
+            page.wait_for_timeout(step_wait_ms)
+        page.evaluate("() => window.scrollTo({top: 0, behavior: 'instant'})")
+    except Exception:
+        pass
+
+def human_visit_block(target_page: Page, dwell_min: float, dwell_max: float) -> int:
+    dwell_seconds = random.uniform(dwell_min, dwell_max)
+    console.print(f"[info]Exercising page & waiting ~{int(dwell_seconds)}s…[/info]")
+    deterministic_scroll_exercise(target_page, duration_seconds=min(10.0, dwell_seconds * 0.4))
+    remaining = max(0.0, dwell_seconds - 10.0)
+    if remaining > 0:
+        target_page.wait_for_timeout(int(remaining * 1000))
+    return int(dwell_seconds)
+
+# ---------- CTA finders ----------
+def find_primary_cta(page: Page) -> Optional[Locator]:
+    """
+    Find 'Strong 8K' CTA by ARIA role first, fall back to common clickable selectors.
+    """
+    pattern = re.compile(CTA_PRIMARY_REGEX, re.I)
+    try:
+        lnk = page.get_by_role("link", name=pattern).first
+        if lnk and lnk.is_visible():
+            return lnk
+    except Exception:
+        pass
+    try:
+        btn = page.get_by_role("button", name=pattern).first
+        if btn and btn.is_visible():
+            return btn
+    except Exception:
+        pass
+    # Fallback scan
+    try:
+        cand = page.locator(
+            "a, button, [role=button], .btn, .button, [class*=btn], [class*=button], [class*=cta]",
+            has_text=pattern
+        ).first
+        if cand and cand.count() > 0 and cand.is_visible():
+            return cand
+    except Exception:
+        pass
+    return None
+
+def find_android_anchor_on_current_page(page: Page) -> Optional[Locator]:
+    """
+    Find the anchor on the *current* page with visible text containing 'Strong 8K For Android'.
+    Does NOT navigate anywhere; returns a Locator or None.
+    """
+    regex = re.compile(CTA_ANDROID_TEXT, re.I)
+
+    # Prefer an <a> (emoji-safe): matches <a class="btn btn-primary">📥 Strong 8K For Android</a>
+    try:
+        loc = page.locator("a", has_text=regex).first
+        if loc and loc.count() > 0:
+            loc.wait_for(state="visible", timeout=3000)
+            try: loc.scroll_into_view_if_needed(timeout=2000)
+            except Exception: pass
+            return loc
+    except Exception:
+        pass
+
+    # Fallback: any text → nearest <a>
+    try:
+        node = page.get_by_text(regex).first
+        node.wait_for(timeout=2000)
+        anchor = node.locator("xpath=ancestor-or-self::a[1]").first
+        anchor.wait_for(state="visible", timeout=2000)
+        try: anchor.scroll_into_view_if_needed(timeout=2000)
+        except Exception: pass
+        return anchor
+    except Exception:
+        return None
+
+# ---------- Robust clickers ----------
+def click_anchor_and_wait(page: Page, anchor: Locator) -> Page:
+    """
+    Click an <a> and wait for navigation if it happens.
+    Returns the Page (same tab).
+    """
+    # Try expecting a navigation
+    try:
+        with page.expect_navigation(timeout=10000):
+            anchor.click(timeout=4000)
+        return page
+    except TimeoutError:
+        pass
+
+    # Same-tab no-nav (e.g., download/SPAs)
+    try:
+        anchor.click(timeout=4000)
+        page.wait_for_timeout(500)
+        return page
+    except Exception:
+        pass
+
+    # Force click
+    try:
+        anchor.click(timeout=4000, force=True)
+        page.wait_for_timeout(500)
+        return page
+    except Exception:
+        pass
+
+    # JS click (last resort)
+    try:
+        handle = anchor.element_handle(timeout=1500)
+        if handle:
+            handle.evaluate("(el) => el.click()")
+            page.wait_for_timeout(500)
+            return page
+    except Exception:
+        pass
+
+    raise TimeoutError("Android anchor click failed with all strategies")
+
+def click_primary_cta(page: Page, cta: Locator) -> Tuple[Page, str]:
+    """
+    Click the primary CTA. Return (page, 'same-tab' or 'popup').
+    """
+    def _wait_load(p: Page):
+        try:
+            p.wait_for_load_state("networkidle", timeout=20000)
+        except TimeoutError:
+            p.wait_for_load_state("domcontentloaded", timeout=12000)
+
+    # Try popup first (unlikely)
+    try:
+        with page.expect_popup(timeout=6000) as pop_info:
+            cta.click(timeout=6000)
+        popup = pop_info.value
+        console.print("[info]→ CTA clicked; popup opened[/info]")
+        _wait_load(popup)
+        return popup, "popup"
+    except Exception:
+        pass
+
+    # Same-tab attempts
+    for kwargs in ({}, {"force": True}):
+        try:
+            cta.click(timeout=6000, **kwargs)
+            _wait_load(page)
+            return page, "same-tab"
+        except Exception:
+            continue
+
+    # JS click
+    try:
+        handle = cta.element_handle(timeout=2000)
+        if handle:
+            handle.evaluate("(el) => el.click()")
+            _wait_load(page)
+            return page, "same-tab"
+    except Exception:
+        pass
+
+    raise TimeoutError("Primary CTA click failed with all strategies")
+
+
+# =========================
+# Visit routine (fresh proxy per URL)
+# =========================
+def visit_once(i: int, total: int, url: str, delay_seconds: float, dwell_min: float, dwell_max: float, check_ip: bool) -> None:
+    """
+    IMPORTANT:
+    This function starts a FRESH Playwright instance and LAUNCHES a NEW Chromium browser
+    WITH proxy for every single URL. That guarantees a new proxy connection each time.
+    """
+    header_panel(i, total, url, 0)
+
+    if (CLIENT_CERT_PATH or CLIENT_KEY_PATH) and not certs_available():
+        console.print("[warn]ℹ️ Client TLS cert/key not found; proceeding without them.[/warn]")
+
+    t0 = time.perf_counter()
+    clicked_primary = False
+    nav_mode_primary = "-"
+    final_url_primary = "-"
+    load_ok = False
+    err_text = "-"
+
+    android_found = False
+    android_clicked = False
+    final_url_android = "-"
+    android_dwell = 0
+    first_dwell = 0
+
+    try:
+        # Fresh Playwright instance → fresh Chromium process → fresh proxy connection
+        with sync_playwright() as pw:
+            browser = start_browser(pw)
+            context = new_context(browser)
+
+            # Optional: prove the outbound proxy/IP for this visit
+            print_outbound_ip(context, enabled=check_ip)
+
+            page = context.new_page()
+            # Inject GA4 QA markers BEFORE navigating
+            mark_session_as_qa(page)
+
+            try:
+                console.print("[info]Navigating…[/info]")
+                page.goto(url, timeout=25000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                load_ok = True
+                console.print("[ok]✓ Page loaded[/ok]")
+            except TimeoutError:
+                err_text = "Timeout during load"
+                console.print("[warn]⏱️ Timeout during load[/warn]")
+            except Exception as e:
+                err_text = f"Navigation error: {e}"
+                console.print(f"[err]✖ Navigation error:[/err] {e}")
+
+            target_page = page
+            if load_ok:
+                # 1) Primary CTA
+                try:
+                    cta = find_primary_cta(page)
+                    if cta:
+                        try:
+                            preview = cta.inner_text(timeout=1000).strip()
+                        except Exception:
+                            preview = "Strong 8K"
+                        console.print(f"[info]CTA candidate:[/info] {short_text(preview, max(20, term_width()-20))}")
+                        target_page, nav_mode_primary = click_primary_cta(page, cta)
+                        clicked_primary = True
+                        console.print("[ok]✓ Click success & target loaded[/ok]")
+                    else:
+                        console.print("[warn]No clickable 'Strong 8K' found[/warn]")
+                except Exception as click_error:
+                    err_text = f"CTA click error: {click_error}"
+                    console.print(f"[warn]⚠️ Could not click CTA:[/warn] {click_error}")
+
+                # 2) FIRST human-like visit block
+                first_dwell = human_visit_block(target_page, dwell_min, dwell_max)
+                try:
+                    final_url_primary = target_page.url
+                except Exception:
+                    final_url_primary = "-"
+
+                # 3) ANDROID STEP — find & click the anchor on the CURRENT page ONLY
+                try:
+                    target_page.wait_for_timeout(300)  # small grace for layout
+                    android_loc = find_android_anchor_on_current_page(target_page)
+                    if android_loc:
+                        android_found = True
+                        try:
+                            preview = android_loc.inner_text(timeout=1000).strip()
+                        except Exception:
+                            preview = "Strong 8K For Android"
+                        console.print(f"[info]Android CTA on page:[/info] {short_text(preview, max(20, term_width()-20))}")
+
+                        # Click and wait (same tab expected)
+                        target_page = click_anchor_and_wait(target_page, android_loc)
+                        android_clicked = True
+
+                        # Human simulation on the Android target page (20–40s)
+                        android_dwell = human_visit_block(target_page, ANDROID_DWELL_MIN, ANDROID_DWELL_MAX)
+
+                        try:
+                            final_url_android = target_page.url
+                        except Exception:
+                            final_url_android = "-"
+                    else:
+                        console.print("[warn]No 'Strong 8K For Android' anchor visible on current page[/warn]")
+                except Exception as e:
+                    console.print(f"[warn]⚠️ Android CTA step error:[/warn] {e}")
+
+            # Clean up this visit completely: close context & browser (tears down proxy connection)
+            context.close()
+            browser.close()
+
+    except Exception as e:
+        err_text = f"Browser error: {e}"
+        console.print(f"[err]✖ Browser error:[/err] {e}")
+
+    # Spacing between visits
+    time.sleep(delay_seconds)
+
+    # Summary
+    dt = time.perf_counter() - t0
+    sum_data = {
+        "Loaded": "yes" if load_ok else "no",
+        "CTA clicked": "yes" if clicked_primary else "no",
+        "Nav mode": nav_mode_primary,
+        "First dwell (s)": first_dwell,
+        "Final URL": short_text(final_url_primary, max(24, term_width()-20)),
+        "Android CTA found": "yes" if android_found else "no",
+        "Android clicked": "yes" if android_clicked else "no",
+        "Android dwell (s)": android_dwell,
+        "Android URL": short_text(final_url_android, max(24, term_width()-20)),
+        "Elapsed (s)": f"{dt:.1f}",
+        "Error": err_text,
+    }
+    summary_table(sum_data)
+    console.rule("[muted]-[/muted]")
+
+
+# =========================
+# Planning
+# =========================
+def plan_sequence(urls: List[str], total_count: int) -> List[str]:
+    base = urls[:]
+    if not base:
+        return []
+    if total_count <= 0:
+        return base
+    full_cycles, remainder = divmod(total_count, len(base))
+    plan: List[str] = []
+    for _ in range(full_cycles):
+        plan.extend(base)
+    if remainder:
+        plan.extend(base[:remainder])
+    return plan
+
+
+# =========================
+# CLI
+# =========================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Fresh-proxy-per-URL QA visits: GA4 injection, click 'Strong 8K', then click 'Strong 8K For Android' on the SAME page, with human simulation."
+    )
+    parser.add_argument("--urls", "-u", type=str, default="urls.txt",
+                        help="Path to a file with one URL per line (default: urls.txt)")
+    parser.add_argument("--count", "-n", type=int, default=0,
+                        help="Total visits to perform (0 = visit each URL once)")
+    parser.add_argument("--delay", "-d", type=float, default=1.0,
+                        help="Delay between visits in seconds")
+    parser.add_argument("--dwell-min", type=float, default=RANDOM_DWELL_MIN,
+                        help="Minimum dwell time (seconds) for the FIRST visit block.")
+    parser.add_argument("--dwell-max", type=float, default=RANDOM_DWELL_MAX,
+                        help="Maximum dwell time (seconds) for the FIRST visit block.")
+    parser.add_argument("--check-ip", action="store_true",
+                        help="If set, fetch and print the outbound IP at the start of each visit to prove fresh proxy routing.")
+    args = parser.parse_args()
+
+    if args.delay > 60:
+        console.print("[warn]⚠️ Delay seems large; confirm units are seconds[/warn]")
+
+    if args.dwell_min <= 0 or args.dwell_max <= 0 or args.dwell_max < args.dwell_min:
+        console.print("[err]✖ Invalid dwell range. Ensure: 0 < --dwell-min <= --dwell-max[/err]")
+        return
+
+    urls = read_urls(args.urls)
+    if not urls:
+        console.print("[err]✖ No URLs to visit. Exiting.[/err]")
+        return
+
+    planned = plan_sequence(urls, args.count)
+    console.print(f"[info]Planned visits:[/info] {len(planned)}  "
+                  f"[muted](unique per cycle: {len(urls)})[/muted]")
+    console.print(f"[info]Random dwell (first block):[/info] {args.dwell_min:.0f}s–{args.dwell_max:.0f}s")
+    console.print(f"[info]Android dwell window:[/info] {ANDROID_DWELL_MIN:.0f}s–{ANDROID_DWELL_MAX:.0f}s")
+    if args.check_ip:
+        console.print("[info]Outbound IP check is ENABLED per visit[/info]")
+    console.rule("[title]RUN[/title]")
+
+    for i, url in track(enumerate(planned, start=1), total=len(planned), description="Visits", transient=True):
+        visit_once(i, len(planned), url, args.delay, args.dwell_min, args.dwell_max, args.check_ip)
+
+    console.rule("[title]DONE[/title]")
+    console.print("[ok]All visits complete![/ok]")
+
+
+if __name__ == "__main__":
+    main()
